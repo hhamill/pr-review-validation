@@ -1,0 +1,85 @@
+name: Reviewer Checklist Gate
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]   # re-check on body changes
+  pull_request_review:
+    types: [submitted]                                # enforce at approval time
+
+permissions:
+  contents: read
+  pull-requests: write   # needed for optional bot "request changes" step
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify reviewer checklist (scoped by markers)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { context, core, github } = require('@actions/github');
+
+            const pr = context.payload.pull_request
+              || (context.payload.review && context.payload.pull_request);
+            if (!pr) {
+              core.info('No PR found in payload; exiting.');
+              return;
+            }
+
+            const isApprovalEvent =
+              context.eventName === 'pull_request_review' &&
+              (context.payload.review?.state || '').toLowerCase() === 'approved';
+
+            // Only enforce on approval events or when the PR body changes
+            const shouldCheck =
+              isApprovalEvent || context.eventName === 'pull_request';
+            if (!shouldCheck) {
+              core.info('Event not eligible for enforcement; exiting.');
+              return;
+            }
+
+            const body = pr.body || '';
+
+            // Look for hidden markers (case-insensitive, robust to whitespace)
+            const startRe = /<!--\s*REVIEWER_CHECKLIST:START\s*-->/i;
+            const endRe   = /<!--\s*REVIEWER_CHECKLIST:END\s*-->/i;
+
+            if (!startRe.test(body) || !endRe.test(body)) {
+              core.info('Checklist markers not found; skipping enforcement (no-op).');
+              return; // PASS: repo opted out by omitting the template
+            }
+
+            // Extract only the section between markers
+            const section = body.split(startRe)[1].split(endRe)[0];
+
+            // Count unchecked tasks strictly within the section
+            // Allow either "- [ ]" or "* [ ]" styles; ignore checked "[x]" / "[X]"
+            const uncheckedMatches = section.match(/^[\s>*-]*[\*\-]\s*\[\s\]\s+/gmi) || [];
+            const unchecked = uncheckedMatches.length;
+
+            // Optional: ensure there is at least 1 task in the section
+            const anyTask = /[\*\-]\s*\[\s*[xX ]\s*\]\s+/.test(section);
+
+            if (!anyTask) {
+              core.setFailed('Reviewer checklist markers found, but no tasks detected inside.');
+              // Optionally post a bot note guiding the maintainer to add tasks.
+              return;
+            }
+
+            if (unchecked > 0) {
+              core.setFailed(`Checklist incomplete: ${unchecked} item(s) unchecked.`);
+
+              // Optional: if triggered by approval, flip it to "request changes" for visibility
+              if (isApprovalEvent) {
+                await github.rest.pulls.createReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  event: 'REQUEST_CHANGES',
+                  body: `❌ Reviewer checklist incomplete: ${unchecked} item(s) unchecked. Please complete the checklist in the PR description (between \`REVIEWER_CHECKLIST:START/END\`).`
+                });
+              }
+            } else {
+              core.info('Checklist complete ✅');
+            }
